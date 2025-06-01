@@ -25,7 +25,7 @@ from diffusers.models.attention_processor import Attention, AttnAddedKVProcessor
 from diffusers.models.dual_transformer_2d import DualTransformer2DModel
 from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
-from src.transformerhacked_tryon import Transformer2DModel
+from model.diffusion.transformerhacked_tryon import Transformer2DModel
 from einops import rearrange
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -729,11 +729,10 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        garment_features=None,
-        curr_garment_feat_idx=0,
     ) -> torch.FloatTensor:
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
         hidden_states = self.resnets[0](hidden_states, temb, scale=lora_scale)
+        garment_features = []
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if self.training and self.gradient_checkpointing:
 
@@ -747,15 +746,13 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
                 hidden_states = torch.utils.checkpoint.checkpoint(
@@ -765,20 +762,18 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     **ckpt_kwargs,
                 )
             else:
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
                 hidden_states = resnet(hidden_states, temb, scale=lora_scale)
-
-        return hidden_states,curr_garment_feat_idx
+            garment_features += out_garment_feat
+        return hidden_states,garment_features
 
 
 class UNetMidBlock2DSimpleCrossAttn(nn.Module):
@@ -1129,18 +1124,13 @@ class CrossAttnDownBlock2D(nn.Module):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         additional_residuals: Optional[torch.FloatTensor] = None,
-        garment_features=None,
-        curr_garment_feat_idx=0,
     ) -> Tuple[torch.FloatTensor, Tuple[torch.FloatTensor, ...]]:
         output_states = ()
 
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
 
         blocks = list(zip(self.resnets, self.attentions))
-        # print("len(self.resnets)")
-        # print(len(self.resnets))
-        # print("len(self.attentions)")
-        # print(len(self.attentions))
+        garment_features = []
         for i, (resnet, attn) in enumerate(blocks):
             if self.training and self.gradient_checkpointing:
 
@@ -1160,32 +1150,27 @@ class CrossAttnDownBlock2D(nn.Module):
                     temb,
                     **ckpt_kwargs,
                 )
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
             else:
                 hidden_states = resnet(hidden_states, temb, scale=lora_scale)
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
-
-
+            garment_features += out_garment_feat
             # apply additional residuals to the output of the last pair of resnet and attention blocks
             if i == len(blocks) - 1 and additional_residuals is not None:
                 hidden_states = hidden_states + additional_residuals
@@ -1198,7 +1183,7 @@ class CrossAttnDownBlock2D(nn.Module):
 
             output_states = output_states + (hidden_states,)
 
-        return hidden_states, output_states,curr_garment_feat_idx
+        return hidden_states, output_states,garment_features
 
 
 class DownBlock2D(nn.Module):
@@ -2315,8 +2300,6 @@ class CrossAttnUpBlock2D(nn.Module):
         upsample_size: Optional[int] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        garment_features=None,
-        curr_garment_feat_idx=0,
     ) -> torch.FloatTensor:
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
         is_freeu_enabled = (
@@ -2325,7 +2308,7 @@ class CrossAttnUpBlock2D(nn.Module):
             and getattr(self, "b1", None)
             and getattr(self, "b2", None)
         )
-
+        garment_features = []
         for resnet, attn in zip(self.resnets, self.attentions):
 
             res_hidden_states = res_hidden_states_tuple[-1]
@@ -2364,37 +2347,32 @@ class CrossAttnUpBlock2D(nn.Module):
                     temb,
                     **ckpt_kwargs,
                 )
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
             else:
                 hidden_states = resnet(hidden_states, temb, scale=lora_scale)
-                hidden_states,curr_garment_feat_idx = attn(
+                hidden_states,out_garment_feat = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
                 hidden_states=hidden_states[0]
+            garment_features += out_garment_feat
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size, scale=lora_scale)
 
-
-
-        return hidden_states,curr_garment_feat_idx
+        return hidden_states,garment_features
 
 
 class UpBlock2D(nn.Module):

@@ -21,7 +21,7 @@ from torch import nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import ImagePositionalEmbeddings
 from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate, is_torch_version
-from src.attentionhacked_tryon import BasicTransformerBlock
+from model.diffusion.attentionhacked_tryon import BasicTransformerBlock
 from diffusers.models.embeddings import PatchEmbed, PixArtAlphaTextProjection
 from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 from diffusers.models.modeling_utils import ModelMixin
@@ -253,8 +253,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Dict[str, Any] = None,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        garment_features=None,
-        curr_garment_feat_idx=0,
         return_dict: bool = True,
     ):
         """
@@ -366,7 +364,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
-
+        garment_features = []
         for block in self.transformer_blocks:
             if self.training and self.gradient_checkpointing:
 
@@ -380,7 +378,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states,curr_garment_feat_idx = torch.utils.checkpoint.checkpoint(
+                hidden_states,out_garment_feat = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
                     attention_mask,
@@ -389,12 +387,10 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
-                    garment_features,
-                    curr_garment_feat_idx,
                     **ckpt_kwargs,
                 )
             else:
-                hidden_states,curr_garment_feat_idx = block(
+                hidden_states,out_garment_feat = block(
                     hidden_states,
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
@@ -402,11 +398,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     timestep=timestep,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
-
- 
+            garment_features += out_garment_feat
         # 3. Output
         if self.is_input_continuous:
             if not self.use_linear_projection:
@@ -462,6 +455,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             )
 
         if not return_dict:
-            return (output,),curr_garment_feat_idx
+            return (output,) ,garment_features
 
-        return Transformer2DModelOutput(sample=output),curr_garment_feat_idx
+        return Transformer2DModelOutput(sample=output),garment_features

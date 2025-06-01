@@ -290,16 +290,11 @@ class BasicTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
-        garment_features=None,
-        curr_garment_feat_idx=0,
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.FloatTensor:
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Self-Attention
         batch_size = hidden_states.shape[0]
-
-        
-        
         if self.use_ada_layer_norm:
             norm_hidden_states = self.norm1(hidden_states, timestep)
         elif self.use_ada_layer_norm_zero:
@@ -323,6 +318,8 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+        garment_features = []
+        garment_features.append(norm_hidden_states)
         # 1. Retrieve lora scale.
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
 
@@ -331,11 +328,8 @@ class BasicTransformerBlock(nn.Module):
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
 
-        modify_norm_hidden_states = torch.cat([norm_hidden_states,garment_features[curr_garment_feat_idx]], dim=1)
-        curr_garment_feat_idx +=1
         attn_output = self.attn1(
-            #norm_hidden_states,
-            modify_norm_hidden_states,
+            norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
             **cross_attention_kwargs,
@@ -345,11 +339,7 @@ class BasicTransformerBlock(nn.Module):
         elif self.use_ada_layer_norm_single:
             attn_output = gate_msa * attn_output
 
-        hidden_states = attn_output[:,:hidden_states.shape[-2],:] + hidden_states
-
-
-
-
+        hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
@@ -412,7 +402,8 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
-        return hidden_states,curr_garment_feat_idx
+
+        return hidden_states, garment_features
 
 
 @maybe_allow_in_graph

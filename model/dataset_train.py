@@ -230,7 +230,7 @@ class VitonHDDataset(data.Dataset):
         result["inpaint_mask"] = 1-mask #VAE condition
         result["im_mask"] = im_mask #VAE condition
         result["caption"] = "model is wearing " + cloth_annotation
-        result["caption_cloth"] = "a photo of " + cloth_annotation
+        result["caption_cloth"] = "a frontal view photo of " + cloth_annotation
         result["annotation"] = cloth_annotation
         result["pose_img"] = pose_img #VAE condition (later phase)
 

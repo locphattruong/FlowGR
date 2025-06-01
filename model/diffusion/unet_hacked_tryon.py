@@ -44,10 +44,8 @@ from diffusers.models.embeddings import (
     TimestepEmbedding,
     Timesteps,
 )
-
-
 from diffusers.models.modeling_utils import ModelMixin
-from src.unet_block_hacked_tryon import (
+from model.diffusion.unet_block_hacked_tryon import (
     UNetMidBlock2D,
     UNetMidBlock2DCrossAttn,
     UNetMidBlock2DSimpleCrossAttn,
@@ -56,9 +54,6 @@ from src.unet_block_hacked_tryon import (
 )
 from diffusers.models.resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
 from diffusers.models.transformer_2d import Transformer2DModel
-import math
-
-from ip_adapter.ip_adapter import Resampler
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -470,21 +465,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             self.encoder_hid_proj = ImageProjection(
                 image_embed_dim=encoder_hid_dim,
                 cross_attention_dim=cross_attention_dim,
-            )
-        elif encoder_hid_dim_type == "ip_image_proj":
-            # Kandinsky 2.2
-            self.encoder_hid_proj = Resampler(
-                dim=1280,
-                depth=4,
-                dim_head=64,
-                heads=20,
-                num_queries=16,
-                embedding_dim=encoder_hid_dim,
-                output_dim=self.config.cross_attention_dim,
-                ff_mult=4,
-            )
-                                    
-            
+            )       
         elif encoder_hid_dim_type is not None:
             raise ValueError(
                 f"encoder_hid_dim_type: {encoder_hid_dim_type} must be None, 'text_proj' or 'text_image_proj'."
@@ -770,25 +751,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
 
 
-        from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
-
-        attn_procs = {}
-        for name in self.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else self.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = self.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(self.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = self.config.block_out_channels[block_id]
-            if cross_attention_dim is None:
-                attn_procs[name] = AttnProcessor()
-            else:
-                layer_name = name.split(".processor")[0]
-                attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=16)
-        self.set_attn_processor(attn_procs)
 
 
     @property
@@ -1018,7 +980,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        garment_features: Optional[Tuple[torch.Tensor]] = None,
     ) -> Union[UNet2DConditionOutput, Tuple]:
         r"""
         The [`UNet2DConditionModel`] forward method.
@@ -1089,6 +1050,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 # Forward upsample size to force interpolation output size.
                 forward_upsample_size = True
                 break
+
         # ensure attention_mask is a bias, and give it a singleton query_tokens dimension
         # expects mask of shape:
         #   [batch, key_tokens]
@@ -1237,21 +1199,18 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
                 )
             image_embeds = added_cond_kwargs.get("image_embeds")
-            # print(image_embeds.shape)
-            # image_embeds = self.encoder_hid_proj(image_embeds).to(encoder_hidden_states.dtype)
+            image_embeds = self.encoder_hid_proj(image_embeds).to(encoder_hidden_states.dtype)
             encoder_hidden_states = torch.cat([encoder_hidden_states, image_embeds], dim=1)
 
         # 2. pre-process
         sample = self.conv_in(sample)
+        garment_features=[]
 
         # 2.5 GLIGEN position net
         if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
             cross_attention_kwargs = cross_attention_kwargs.copy()
             gligen_args = cross_attention_kwargs.pop("gligen")
             cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
-
-
-        curr_garment_feat_idx = 0
 
 
         # 3. down
@@ -1286,24 +1245,23 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
 
-                sample, res_samples,curr_garment_feat_idx = downsample_block(
+                sample, res_samples,out_garment_feat = downsample_block(
                     hidden_states=sample,
                     temb=emb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                     encoder_attention_mask=encoder_attention_mask,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                     **additional_residuals,
                 )
+                garment_features += out_garment_feat
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb, scale=lora_scale)
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     sample += down_intrablock_additional_residuals.pop(0)
 
             down_block_res_samples += res_samples
-
+        
 
         if is_controlnet:
             new_down_block_res_samples = ()
@@ -1319,16 +1277,16 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # 4. mid
         if self.mid_block is not None:
             if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
-                sample ,curr_garment_feat_idx= self.mid_block(
+                sample,out_garment_feat = self.mid_block(
                     sample,
                     emb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                     encoder_attention_mask=encoder_attention_mask,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
+                garment_features += out_garment_feat
+
             else:
                 sample = self.mid_block(sample, emb)
 
@@ -1358,7 +1316,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 upsample_size = down_block_res_samples[-1].shape[2:]
 
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
-                sample ,curr_garment_feat_idx= upsample_block(
+                sample,out_garment_feat = upsample_block(
                     hidden_states=sample,
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
@@ -1367,29 +1325,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     upsample_size=upsample_size,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,
-                    garment_features=garment_features,
-                    curr_garment_feat_idx=curr_garment_feat_idx,
                 )
-
-            else:
-                sample = upsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    res_hidden_states_tuple=res_samples,
-                    upsample_size=upsample_size,
-                    scale=lora_scale,
-                )
-        # 6. post-process
-        if self.conv_norm_out:
-            sample = self.conv_norm_out(sample)
-            sample = self.conv_act(sample)
-        sample = self.conv_out(sample)
-
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
+                garment_features += out_garment_feat
 
         if not return_dict:
-            return (sample,)
+            return (sample,),garment_features
 
-        return UNet2DConditionOutput(sample=sample)
+        return UNet2DConditionOutput(sample=sample),garment_features

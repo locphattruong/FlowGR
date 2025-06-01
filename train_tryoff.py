@@ -13,8 +13,8 @@ from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPTextModelWithProjection
 
-from model.diffusion.unet_hacked_tryon import UNet2DConditionModel
-from model.diffusion.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
+from model.diffusion.unet_hacked_tryon import UNet2DConditionModel as UNet2DConditionModel_ref
+from model.diffusion.unet_hacked_garmnet import UNet2DConditionModel
 from model.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 
 from ip_adapter.ip_adapter import Resampler
@@ -94,13 +94,14 @@ def main():
     tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_2")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path,subfolder="vae",torch_dtype=torch.float16,)
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(args.pretrained_garmentnet_path, subfolder="unet")
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     unet_encoder.config.addition_embed_type = None
     unet_encoder.config["addition_embed_type"] = None
+    print("UNET ENCODER input channels:", unet_encoder.config.in_channels)
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
 
     #customize unet start
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet",low_cpu_mem_usage=False, device_map=None)
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_garmentnet_path, subfolder="unet",low_cpu_mem_usage=False, device_map=None)
     unet.config.encoder_hid_dim = image_encoder.config.hidden_size
     unet.config.encoder_hid_dim_type = "ip_image_proj"
     unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
@@ -130,21 +131,22 @@ def main():
 
     unet.encoder_hid_proj = image_proj_model
 
-    conv_new = torch.nn.Conv2d(
-        in_channels=4+4+1+4,
-        out_channels=unet.conv_in.out_channels,
-        kernel_size=3,
-        padding=1,
-    )
-    torch.nn.init.kaiming_normal_(conv_new.weight)  
-    conv_new.weight.data = conv_new.weight.data * 0.  
+    # Temporarily dont need new conv, will think about it when using pose for conditioning later
+    # conv_new = torch.nn.Conv2d(
+    #     in_channels=4+4+1+4,
+    #     out_channels=unet.conv_in.out_channels,
+    #     kernel_size=3,
+    #     padding=1,
+    # )
+    # torch.nn.init.kaiming_normal_(conv_new.weight)  
+    # conv_new.weight.data = conv_new.weight.data * 0.  
 
-    conv_new.weight.data[:, :9] = unet.conv_in.weight.data  
-    conv_new.bias.data = unet.conv_in.bias.data  
+    # conv_new.weight.data[:, :9] = unet.conv_in.weight.data  
+    # conv_new.bias.data = unet.conv_in.bias.data  
 
-    unet.conv_in = conv_new  # replace conv layer in unet
-    unet.config['in_channels'] = 13  # update config
-    unet.config.in_channels = 13  # update config
+    # unet.conv_in = conv_new  # replace conv layer in unet
+    # unet.config['in_channels'] = 13  # update config
+    # unet.config.in_channels = 13  # update config
     #customize unet end
 
 
@@ -248,7 +250,7 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
+    print("SUCCESS")
     # Train!
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -263,117 +265,15 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet), accelerator.accumulate(image_proj_model):
-                if global_step % args.logging_steps == 0:
-                    if accelerator.is_main_process:
-                        with torch.no_grad():
-                            with torch.cuda.amp.autocast():
-                                unwrapped_unet= accelerator.unwrap_model(unet)
-                                newpipe = TryonPipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    unet=unwrapped_unet,
-                                    vae= vae,
-                                    scheduler=noise_scheduler,
-                                    tokenizer=tokenizer,
-                                    tokenizer_2=tokenizer_2,
-                                    text_encoder=text_encoder,
-                                    text_encoder_2=text_encoder_2,
-                                    image_encoder=image_encoder,
-                                    unet_encoder = unet_encoder,
-                                    torch_dtype=torch.float16,
-                                    add_watermarker=False,
-                                    safety_checker=None,
-                                ).to(accelerator.device)
-                                with torch.no_grad():
-                                    for sample in test_dataloader:
-                                        img_emb_list = []
-                                        for i in range(sample['cloth'].shape[0]):
-                                            img_emb_list.append(sample['cloth'][i])
-
-                                        prompt = sample["caption"] # "model is wearing " + cloth_annotation
-
-                                        num_prompts = sample['cloth'].shape[0]                                        
-                                        negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-
-                                        if not isinstance(prompt, List):
-                                            prompt = [prompt] * num_prompts
-                                        if not isinstance(negative_prompt, List):
-                                            negative_prompt = [negative_prompt] * num_prompts
-
-                                        image_embeds = torch.cat(img_emb_list,dim=0) #cloth image: B, 3, 224, 224
-                                        
-                                        with torch.inference_mode():
-                                            (
-                                                prompt_embeds,
-                                                negative_prompt_embeds,
-                                                pooled_prompt_embeds,
-                                                negative_pooled_prompt_embeds,
-                                            ) = newpipe.encode_prompt(
-                                                prompt,
-                                                num_images_per_prompt=1,
-                                                do_classifier_free_guidance=True,
-                                                negative_prompt=negative_prompt,
-                                            )
-                                            
-                                        
-                                            prompt = sample["caption_cloth"] # "a photo of " + cloth_annotation
-                                            negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-
-                                            if not isinstance(prompt, List):
-                                                prompt = [prompt] * num_prompts
-                                            if not isinstance(negative_prompt, List):
-                                                negative_prompt = [negative_prompt] * num_prompts
-
-
-                                            with torch.inference_mode():
-                                                (
-                                                    prompt_embeds_c,
-                                                    _,
-                                                    _,
-                                                    _,
-                                                ) = newpipe.encode_prompt(
-                                                    prompt,
-                                                    num_images_per_prompt=1,
-                                                    do_classifier_free_guidance=False,
-                                                    negative_prompt=negative_prompt,
-                                                )
-                                            
-
-
-                                            generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed is not None else None #make the generation deterministic
-                                            images = newpipe(
-                                                prompt_embeds=prompt_embeds,
-                                                negative_prompt_embeds=negative_prompt_embeds,
-                                                pooled_prompt_embeds=pooled_prompt_embeds,
-                                                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                                                num_inference_steps=args.num_inference_steps,
-                                                generator=generator,
-                                                strength = 1.0,
-                                                pose_img = sample['pose_img'],
-                                                text_embeds_cloth=prompt_embeds_c,
-                                                cloth = sample["cloth_pure"].to(accelerator.device),
-                                                mask_image=sample['inpaint_mask'],
-                                                image=(sample['image']+1.0)/2.0, 
-                                                height=args.height,
-                                                width=args.width,
-                                                guidance_scale=args.guidance_scale,
-                                                ip_adapter_image = image_embeds,
-                                            )[0]
-
-                                        for i in range(len(images)):
-                                            images[i].save(os.path.join(args.output_dir,str(global_step)+"_"+str(i)+"_"+"test.jpg"))                                    
-                                        break
-                        del unwrapped_unet
-                        del newpipe                
-                        torch.cuda.empty_cache()
-
-                pixel_values = batch["image"].to(dtype=vae.dtype)
-                model_input = vae.encode(pixel_values).latent_dist.sample()
-                model_input = model_input * vae.config.scaling_factor
+            # ---1. Prepare latents for Reference Branch (RefNet)---
+                ori_person = batch["image"].to(dtype=vae.dtype) 
+                ori_person = vae.encode(ori_person).latent_dist.sample()
+                ori_person = ori_person * vae.config.scaling_factor
                 
-                masked_latents = vae.encode(
+                masked_person = vae.encode(
                     batch["im_mask"].reshape(batch["image"].shape).to(dtype=vae.dtype)
                 ).latent_dist.sample()
-                masked_latents = masked_latents * vae.config.scaling_factor
+                masked_person = masked_person * vae.config.scaling_factor #
                 masks = batch["inpaint_mask"]
                 # resize the mask to latents shape as we concatenate the mask to the latents
                 mask = torch.stack(
@@ -383,36 +283,42 @@ def main():
                 )
                 mask = mask.reshape(-1, 1, args.height // 8, args.width // 8)
 
-                pose_map = vae.encode(batch["pose_img"].to(dtype=vae.dtype)).latent_dist.sample()
-                pose_map = pose_map * vae.config.scaling_factor
+                # pose_map = vae.encode(batch["pose_img"].to(dtype=vae.dtype)).latent_dist.sample()
+                # pose_map = pose_map * vae.config.scaling_factor
+                latent_refnet_input = torch.cat([ori_person, mask, masked_person], dim=1) # B, 9, 64, 48
+                
+            # ---2. Prepare latents for Main Branch (MainNet)---
+                model_cloth_input = batch["cloth_pure"].to(accelerator.device,dtype=vae.dtype)
+                model_cloth_input = vae.encode(model_cloth_input).latent_dist.sample()
+                model_cloth_input = model_cloth_input * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(model_input)
+                noise = torch.randn_like(model_cloth_input)
 
-                bsz = model_input.shape[0]
+                bsz = model_cloth_input.shape[0]
                 timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_cloth_input.device
                     )
                 # Add noise to the latents according to the noise magnitude at each timestep
-                noisy_latents = noise_scheduler.add_noise(model_input, noise, timesteps)
-                latent_model_input = torch.cat([noisy_latents, mask,masked_latents,pose_map], dim=1) # B, 13, 64, 48 : regardless of the input image size
-            
-            
+                noisy_latents = noise_scheduler.add_noise(model_cloth_input, noise, timesteps)
+            # ---3. Get conditions for Main Branch (MainNet): Caption + IP Adapter coarser features---
+                # Caption for mainnet (cloth)
                 text_input_ids = tokenizer(
-                    batch['caption'], # For tryonnet: # "model is wearing " + cloth_annotation
+                    batch['caption_cloth'],
                     max_length=tokenizer.model_max_length,
                     padding="max_length",
                     truncation=True,
                     return_tensors="pt"
                 ).input_ids #token id
                 text_input_ids_2 = tokenizer_2(
-                    batch['caption'],
+                    batch['caption_cloth'],
                     max_length=tokenizer_2.model_max_length,
                     padding="max_length",
                     truncation=True,
                     return_tensors="pt"
                 ).input_ids #token id 
 
+                # encode text input for refnet 
                 encoder_output = text_encoder(text_input_ids.to(accelerator.device), output_hidden_states=True)
                 text_embeds = encoder_output.hidden_states[-2]
                 encoder_output_2 = text_encoder_2(text_input_ids_2.to(accelerator.device), output_hidden_states=True)
@@ -432,35 +338,30 @@ def main():
                 add_time_ids = torch.cat(
                     [compute_time_ids((args.height, args.height)) for i in range(bsz)]
                 )
-                        
+                
+                # prepare coarser features by IP adapter
                 img_emb_list = []
                 for i in range(bsz):
-                    img_emb_list.append(batch['cloth'][i])
+                    img_emb_list.append(batch["cloth_trim"][i])
                 
                 image_embeds = torch.cat(img_emb_list,dim=0)
                 image_embeds = image_encoder(image_embeds, output_hidden_states=True).hidden_states[-2]
                 ip_tokens =image_proj_model(image_embeds)
                 
-
-
                 # add cond
                 unet_added_cond_kwargs = {"text_embeds": pooled_text_embeds, "time_ids": add_time_ids}
                 unet_added_cond_kwargs["image_embeds"] = ip_tokens
-
-                cloth_values = batch["cloth_pure"].to(accelerator.device,dtype=vae.dtype)
-                cloth_values = vae.encode(cloth_values).latent_dist.sample()
-                cloth_values = cloth_values * vae.config.scaling_factor
-
-
+            # ---4. Prepare conditions for Ref Branch: Caption---
+                # Caption for refnet (mask+person)
                 text_input_ids = tokenizer(
-                    batch['caption_cloth'],
+                    batch['caption'],
                     max_length=tokenizer.model_max_length,
                     padding="max_length",
                     truncation=True,
                     return_tensors="pt"
                 ).input_ids
                 text_input_ids_2 = tokenizer_2(
-                    batch['caption_cloth'],
+                    batch['caption'],
                     max_length=tokenizer_2.model_max_length,
                     padding="max_length",
                     truncation=True,
@@ -473,19 +374,21 @@ def main():
                 encoder_output_2 = text_encoder_2(text_input_ids_2.to(accelerator.device), output_hidden_states=True)
                 text_embeds_2_cloth = encoder_output_2.hidden_states[-2]
                 text_embeds_cloth = torch.concat([text_embeds_cloth, text_embeds_2_cloth], dim=-1) # concat
-                down,reference_features = unet_encoder(cloth_values,timesteps, text_embeds_cloth,return_dict=False)
+            # ---5. Get conditions for Main Branch (MainNet): Finer features from Refnet---    
+                down,reference_features = unet_encoder(latent_refnet_input, timesteps, text_embeds_cloth,return_dict=False)
                 reference_features = list(reference_features)
+            # ---6. MainNet forward---    
+                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states,added_cond_kwargs=unet_added_cond_kwargs,garment_features=reference_features).sample
 
-                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states,added_cond_kwargs=unet_added_cond_kwargs,garment_features=reference_features).sample
-
-
+            # ---7. Calculate loss ---
+                # Type of loss & prediction: noise, velocity or original image
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+                    target = noise_scheduler.get_velocity(model_cloth_input, noise, timesteps)
                 elif noise_scheduler.config.prediction_type == "sample":
                     # We set the target to latents here, but the model_pred will return the noise sample prediction.
-                    target = model_input
+                    target = model_cloth_input
                     # We will have to subtract the noise residual from the prediction to get the target sample.
                     model_pred = model_pred - noise
                 else:
@@ -535,31 +438,32 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+        # ---- Finish training iteration ----
 
-        if global_step % args.checkpointing_epoch == 0:
-            if accelerator.is_main_process:
-                # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                unwrapped_unet = accelerator.unwrap_model(
-                    unet, keep_fp32_wrapper=True
-                )
-                pipeline = TryonPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    unet=unwrapped_unet,
-                    vae= vae,
-                    scheduler=noise_scheduler,
-                    tokenizer=tokenizer,
-                    tokenizer_2=tokenizer_2,
-                    text_encoder=text_encoder,
-                    text_encoder_2=text_encoder_2,
-                    image_encoder=image_encoder,
-                    unet_encoder=unet_encoder,
-                    torch_dtype=torch.float16,
-                    add_watermarker=False,
-                    safety_checker=None,
-                )
-                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                pipeline.save_pretrained(save_path)
-                del pipeline
+        # if global_step % args.checkpointing_epoch == 0:
+        #     if accelerator.is_main_process:
+        #         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+        #         unwrapped_unet = accelerator.unwrap_model(
+        #             unet, keep_fp32_wrapper=True
+        #         )
+        #         pipeline = TryonPipeline.from_pretrained(
+        #             args.pretrained_model_name_or_path,
+        #             unet=unwrapped_unet,
+        #             vae= vae,
+        #             scheduler=noise_scheduler,
+        #             tokenizer=tokenizer,
+        #             tokenizer_2=tokenizer_2,
+        #             text_encoder=text_encoder,
+        #             text_encoder_2=text_encoder_2,
+        #             image_encoder=image_encoder,
+        #             unet_encoder=unet_encoder,
+        #             torch_dtype=torch.float16,
+        #             add_watermarker=False,
+        #             safety_checker=None,
+        #         )
+        #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+        #         pipeline.save_pretrained(save_path)
+        #         del pipeline
 
                 
 if __name__ == "__main__":
