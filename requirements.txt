@@ -1,0 +1,23 @@
+torch
+torchvision
+diffusers==0.25.1
+huggingface_hub==0.25.0
+transformers==4.37.2
+sentencepiece==0.2.0
+matplotlib
+tqdm
+accelerate==0.25.0
+pillow
+tensorboard
+loguru
+pre-commit
+torchmetrics==1.2.1
+pyiqa
+dists-pytorch
+clean-fid
+pyssim
+einops==0.7.0
+bitsandbytes==0.39.0
+# scipy==1.11.1
+onnxruntime==1.17.0
+gradio==4.24.0

@@ -3,6 +3,7 @@ import random
 import argparse
 import json
 import itertools
+from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
@@ -15,7 +16,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjec
 
 from model.diffusion.unet_hacked_tryon import UNet2DConditionModel as UNet2DConditionModel_ref
 from model.diffusion.unet_hacked_garmnet import UNet2DConditionModel
-from model.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+from model.tryoff_pipeline import StableDiffusionXLPipeline as TryOffInferencePipeline
 
 from ip_adapter.ip_adapter import Resampler
 from diffusers.utils.import_utils import is_xformers_available
@@ -32,10 +33,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--pretrained_model_name_or_path",type=str,default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",required=False,help="Path to pretrained model or model identifier from huggingface.co/models.",)
     parser.add_argument("--pretrained_garmentnet_path",type=str,default="stabilityai/stable-diffusion-xl-base-1.0",required=False,help="Path to pretrained model or model identifier from huggingface.co/models.",)
-    parser.add_argument("--checkpointing_epoch",type=int,default=10,help=("Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"" training using `--resume_from_checkpoint`."),)
+    parser.add_argument("--checkpointing_epoch",type=int,default=100,help=("Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"" training using `--resume_from_checkpoint`."),)
     parser.add_argument("--pretrained_ip_adapter_path",type=str,default="ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin",help="Path to pretrained ip adapter model. If not specified weights are initialized randomly.",)
     parser.add_argument("--image_encoder_path",type=str,default="ckpt/image_encoder",required=False,help="Path to CLIP image encoder",)
     parser.add_argument("--gradient_checkpointing",action="store_true",help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",)
+    parser.add_argument("--visual_checking",action="store_true",help="Whether or not to perform inference on testset for visually checking during training progress.",)
     parser.add_argument("--width",type=int,default=768,)
     parser.add_argument("--height",type=int,default=1024,)
     parser.add_argument("--gradient_accumulation_steps",type=int,default=1,help="Number of updates steps to accumulate before performing a backward/update pass.",)
@@ -252,6 +254,7 @@ def main():
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     print("SUCCESS")
     # Train!
+    model_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -265,6 +268,113 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet), accelerator.accumulate(image_proj_model):
+                # Inference during training to check the visual result
+                if args.visual_checking:
+                    if global_step % args.logging_steps == 0:
+                        if accelerator.is_main_process:
+                            with torch.no_grad():
+                                with torch.cuda.amp.autocast():
+                                    unwrapped_unet= accelerator.unwrap_model(unet)
+                                    newpipe = TryOffInferencePipeline.from_pretrained(
+                                        args.pretrained_garmentnet_path,
+                                        unet=unwrapped_unet,
+                                        vae= vae,
+                                        scheduler=noise_scheduler,
+                                        tokenizer=tokenizer,
+                                        tokenizer_2=tokenizer_2,
+                                        text_encoder=text_encoder,
+                                        text_encoder_2=text_encoder_2,
+                                        image_encoder=image_encoder,
+                                        unet_encoder = unet_encoder,
+                                        torch_dtype=torch.float16,
+                                        add_watermarker=False,
+                                        safety_checker=None,
+                                    ).to(accelerator.device)
+                                    with torch.no_grad():
+                                        for n_test, sample in enumerate(test_dataloader):
+                                            img_emb_list = []
+                                            for i in range(sample['cloth_trim'].shape[0]):
+                                                img_emb_list.append(sample['cloth_trim'][i])
+
+                                            prompt = sample["caption_cloth"] # "a frontal view photo of " + cloth_annotation
+
+                                            num_prompts = sample['cloth_trim'].shape[0]                                        
+                                            negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+
+                                            if not isinstance(prompt, List):
+                                                prompt = [prompt] * num_prompts
+                                            if not isinstance(negative_prompt, List):
+                                                negative_prompt = [negative_prompt] * num_prompts
+
+                                            image_embeds = torch.cat(img_emb_list,dim=0) #cloth_trim image: B, 3, 224, 224 IP Adapter
+                                            
+                                            with torch.inference_mode():
+                                                (
+                                                    prompt_embeds,
+                                                    negative_prompt_embeds,
+                                                    pooled_prompt_embeds,
+                                                    negative_pooled_prompt_embeds,
+                                                ) = newpipe.encode_prompt(
+                                                    prompt,
+                                                    num_images_per_prompt=1,
+                                                    do_classifier_free_guidance=True,
+                                                    negative_prompt=negative_prompt,
+                                                )
+                                                
+                                            
+                                                prompt = sample["caption"] # "model is wearing " + cloth_annotation
+                                                negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+
+                                                if not isinstance(prompt, List):
+                                                    prompt = [prompt] * num_prompts
+                                                if not isinstance(negative_prompt, List):
+                                                    negative_prompt = [negative_prompt] * num_prompts
+
+
+                                                with torch.inference_mode():
+                                                    (
+                                                        prompt_embeds_p,
+                                                        _,
+                                                        _,
+                                                        _,
+                                                    ) = newpipe.encode_prompt(
+                                                        prompt,
+                                                        num_images_per_prompt=1,
+                                                        do_classifier_free_guidance=False,
+                                                        negative_prompt=negative_prompt,
+                                                    )
+                                                
+
+
+                                                generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed is not None else None #make the generation deterministic
+                                                images = newpipe(
+                                                    prompt_embeds=prompt_embeds,
+                                                    negative_prompt_embeds=negative_prompt_embeds,
+                                                    pooled_prompt_embeds=pooled_prompt_embeds,
+                                                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                                                    num_inference_steps=args.num_inference_steps,
+                                                    generator=generator,
+                                                    # pose_img = sample['pose_img'],
+                                                    text_embeds_person=prompt_embeds_p,
+                                                    mask_image=sample['inpaint_mask'],
+                                                    person_image=(sample['image']+1.0)/2.0, 
+                                                    height=args.height,
+                                                    width=args.width,
+                                                    guidance_scale=args.guidance_scale,
+                                                    ip_adapter_image = image_embeds,
+                                                )[0]
+                        
+                                            for i in range(len(images)):
+                                                images[i].save(os.path.join(
+                                                    args.output_dir,
+                                                    str(global_step)+"_"+str(sample['c_name'][i].split('.')[0])+"_"+"test.jpg"
+                                                    )
+                                                )
+                                            if n_test > 1:
+                                                break
+                            del unwrapped_unet
+                            del newpipe                
+                            torch.cuda.empty_cache()
             # ---1. Prepare latents for Reference Branch (RefNet)---
                 ori_person = batch["image"].to(dtype=vae.dtype) 
                 ori_person = vae.encode(ori_person).latent_dist.sample()
@@ -439,31 +549,30 @@ def main():
             if global_step >= args.max_train_steps:
                 break
         # ---- Finish training iteration ----
-
-        # if global_step % args.checkpointing_epoch == 0:
-        #     if accelerator.is_main_process:
-        #         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-        #         unwrapped_unet = accelerator.unwrap_model(
-        #             unet, keep_fp32_wrapper=True
-        #         )
-        #         pipeline = TryonPipeline.from_pretrained(
-        #             args.pretrained_model_name_or_path,
-        #             unet=unwrapped_unet,
-        #             vae= vae,
-        #             scheduler=noise_scheduler,
-        #             tokenizer=tokenizer,
-        #             tokenizer_2=tokenizer_2,
-        #             text_encoder=text_encoder,
-        #             text_encoder_2=text_encoder_2,
-        #             image_encoder=image_encoder,
-        #             unet_encoder=unet_encoder,
-        #             torch_dtype=torch.float16,
-        #             add_watermarker=False,
-        #             safety_checker=None,
-        #         )
-        #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-        #         pipeline.save_pretrained(save_path)
-        #         del pipeline
+            if global_step % args.checkpointing_epoch == 0:
+                if accelerator.is_main_process:
+                    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                    unwrapped_unet = accelerator.unwrap_model(
+                        unet, keep_fp32_wrapper=True
+                    )
+                    pipeline = TryOffInferencePipeline.from_pretrained(
+                                    args.pretrained_garmentnet_path,
+                                    unet=unwrapped_unet,
+                                    vae= vae,
+                                    scheduler=noise_scheduler,
+                                    tokenizer=tokenizer,
+                                    tokenizer_2=tokenizer_2,
+                                    text_encoder=text_encoder,
+                                    text_encoder_2=text_encoder_2,
+                                    image_encoder=image_encoder,
+                                    unet_encoder = unet_encoder,
+                                    torch_dtype=torch.float16,
+                                    add_watermarker=False,
+                                    safety_checker=None,
+                                ).to(accelerator.device)
+                    save_path = os.path.join(args.output_dir, model_id, f"checkpoint-{global_step}")
+                    pipeline.save_pretrained(save_path)
+                    del pipeline
 
                 
 if __name__ == "__main__":
